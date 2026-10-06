@@ -14,34 +14,38 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Free disk space (base image is ~20 GB)
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Install crane
+        run: |
+          curl -sL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz | tar xz crane
+          sudo mv crane /usr/local/bin/
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - uses: docker/build-push-action@v6
-        with:
-          pull: true
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/krea2-nsfw:latest
-            ghcr.io/${{ github.repository_owner }}/krea2-nsfw:${{ github.sha }}
+      # Stack our start.sh on top of the base as one small layer: no 20 GB unpack, no disk problems.
+      - name: Append start.sh to the base image
+        run: |
+          mkdir -p layer && cp start.sh layer/start.sh && chmod 755 layer/start.sh
+          tar --owner=0 --group=0 --numeric-owner -C layer -cf layer.tar start.sh
+          IMG=ghcr.io/${{ github.repository_owner }}/krea2-nsfw
+          crane append --platform linux/amd64 \
+            -b aiorbust/krea2-nsfw:latest \
+            -f layer.tar \
+            -t $IMG:build-tmp
+          crane mutate $IMG:build-tmp \
+            --cmd /start.sh \
+            -l org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            -l org.opencontainers.image.description="AI Empire Krea 2 NSFW pod" \
+            -t $IMG:latest
+          crane tag $IMG:latest ${{ github.sha }}
+
+      - name: Check the image has our start.sh
+        run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/krea2-nsfw:latest
+          LAST=$(crane manifest $IMG | jq -r '.layers[-1].digest')
+          crane blob ${IMG%:*}@$LAST > last.layer
+          tar -xOf last.layer start.sh > pulled.sh
+          diff -q pulled.sh start.sh && echo "start.sh in image matches repo"
+          ! grep -q CIVITAI_TOKEN pulled.sh && echo "no Civitai key in image"
