@@ -57,6 +57,24 @@ export change_preview_method="true"
 cd "$CUSTOM_NODES_DIR" || exit 1
 
 # Function to download a model using aria2
+# A .safetensors file is complete when its header's last tensor ends exactly at the end of the file.
+# Catches half-finished downloads/uploads that the size check misses (they break the LoRA loader with
+# "incomplete metadata, file not fully covered").
+safetensors_ok() {
+    python3 - "$1" <<'PY'
+import json, os, struct, sys
+p = sys.argv[1]
+try:
+    with open(p, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+    end = max([v["data_offsets"][1] for k, v in header.items() if k != "__metadata__"] or [0])
+    sys.exit(0 if os.path.getsize(p) == 8 + n + end else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
 download_model() {
     local url="$1"
     local full_path="$2"
@@ -65,6 +83,12 @@ download_model() {
     local destination_file=$(basename "$full_path")
 
     mkdir -p "$destination_dir"
+
+    # Half-downloaded .safetensors (e.g. pod stopped mid-download on a network volume) -> fetch again
+    if [ -f "$full_path" ] && [ ! -f "${full_path}.aria2" ] && [[ "$full_path" == *.safetensors ]] && ! safetensors_ok "$full_path"; then
+        echo "🗑️  Incomplete file, downloading again: $full_path"
+        rm -f "$full_path"
+    fi
 
     # Simple corruption check: file < 10MB or .aria2 files
     if [ -f "$full_path" ]; then
@@ -171,6 +195,14 @@ while pgrep -x "aria2c" > /dev/null; do
 done
 
 echo "All models downloaded successfully"
+
+# Any incomplete LoRA left (your own uploads too)? Say so loudly instead of failing later in ComfyUI.
+for f in "$LORAS_DIR"/*.safetensors; do
+    [ -f "$f" ] || continue
+    if ! safetensors_ok "$f"; then
+        echo "⚠️  INCOMPLETE LoRA: $f  -> delete it and upload/download it again (it will fail in the LoRA loader)"
+    fi
+done
 
 # Ensure the file exists in the current directory before moving it
 cd /
